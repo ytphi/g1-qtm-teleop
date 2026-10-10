@@ -1,0 +1,20 @@
+robot:
+  ip: "192.168.123.1"       # G1 default; change if different
+  network_interface: "eth0" # interface connected to G1; check with `ip link`
+  control_freq: 100         # Hz
+  dof: 29                   # confirmed 29-DOF G1 U2
+
+qtm:
+  ip: "192.168.0.1"         # QTM PC IP
+  port: 22223               # qtm_rt needs 22223; 22222 on QTM 2024.2 is legacy protocol 1.0 only (hangs)
+  skeleton_name: "Actor1"   # name assigned in QTM skeleton setup
+
+recording:
+  save_dir: "./episodes"
+  obs_image: true           # G1 head camera
+  image_size: [640, 480]
+
+safety:
+  max_joint_vel: 1.0        # rad/s per joint (rate limit on every command); lower = gentler
+  qtm_timeout: 0.2          # s; older mocap data → hold pose
+  limit_margin: 0.05        # rad inside URDF joint limits

@@ -15,3 +15,6 @@ output/
 # Editor
 .vscode/
 .idea/
+
+# Teleop recordings
+episodes/

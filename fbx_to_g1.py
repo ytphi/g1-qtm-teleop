@@ -39,9 +39,8 @@ try:
     from general_motion_retargeting import RobotMotionViewer
 except ImportError:
     print("\n[ERROR] GMR library not found.")
-    print("Run setup.sh first, or manually install:")
-    print("  git clone https://github.com/YanjieZe/GMR.git")
-    print("  cd GMR && pip install -e .")
+    print("Run `bash setup.sh` first. It clones GMR and applies the QTM patch")
+    print("(gmr_patch/) that the fbx_qtm IK config needs.")
     sys.exit(1)
 
 # --- Blender script: extracts per-frame world-space bone transforms from FBX ---

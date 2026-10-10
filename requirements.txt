@@ -1,3 +1,7 @@
 numpy
 scipy
 tqdm
+pyyaml
+opencv-python
+h5py
+qtm-rt

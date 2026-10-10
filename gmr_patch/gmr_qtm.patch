@@ -1,0 +1,181 @@
+diff --git a/general_motion_retargeting/motion_retarget.py b/general_motion_retargeting/motion_retarget.py
+index b68bfdc..1948fbe 100644
+--- a/general_motion_retargeting/motion_retarget.py
++++ b/general_motion_retargeting/motion_retarget.py
+@@ -271,14 +271,16 @@ class GeneralMotionRetargeting:
+         for body_name in human_data.keys():
+             pos, quat = human_data[body_name]
+             offset_human_data[body_name] = [pos, quat]
++            if body_name not in rot_offsets or body_name not in pos_offsets:
++                continue
+             # apply rotation offset first
+             updated_quat = (R.from_quat(quat, scalar_first=True) * rot_offsets[body_name]).as_quat(scalar_first=True)
+             offset_human_data[body_name][1] = updated_quat
+-            
++
+             local_offset = pos_offsets[body_name]
+             # compute the global position offset using the updated rotation
+             global_pos_offset = R.from_quat(updated_quat, scalar_first=True).apply(local_offset)
+-            
++
+             offset_human_data[body_name][0] = pos + global_pos_offset
+            
+         return offset_human_data
+diff --git a/general_motion_retargeting/params.py b/general_motion_retargeting/params.py
+index 2ccfd9b..074455c 100644
+--- a/general_motion_retargeting/params.py
++++ b/general_motion_retargeting/params.py
+@@ -46,6 +46,18 @@ IK_CONFIG_DICT = {
+         "tienkung": IK_CONFIG_ROOT / "smplx_to_tienkung.json",
+         "fourier_gr3": IK_CONFIG_ROOT / "smplx_to_gr3.json",
+     },
++    "blender_bvh":{
++        "unitree_g1": IK_CONFIG_ROOT / "blender_bvh_to_g1.json",
++    },
++    "qtm_bvh":{
++        "unitree_g1": IK_CONFIG_ROOT / "qtm_bvh_to_g1.json",
++    },
++    "qtm_rt":{   # live QTM real-time skeleton stream (teleop)
++        "unitree_g1": IK_CONFIG_ROOT / "qtm_rt_to_g1.json",
++    },
++    "fbx_qtm":{
++        "unitree_g1": IK_CONFIG_ROOT / "fbx_qtm_to_g1.json",
++    },
+     "bvh_lafan1":{
+         "unitree_g1": IK_CONFIG_ROOT / "bvh_lafan1_to_g1.json",
+         "unitree_g1_with_hands": IK_CONFIG_ROOT / "bvh_lafan1_to_g1.json",
+diff --git a/general_motion_retargeting/robot_motion_viewer.py b/general_motion_retargeting/robot_motion_viewer.py
+index 8589d82..fdaa305 100644
+--- a/general_motion_retargeting/robot_motion_viewer.py
++++ b/general_motion_retargeting/robot_motion_viewer.py
+@@ -79,6 +79,8 @@ class RobotMotionViewer:
+             )      
+ 
+         self.viewer.opt.flags[mj.mjtVisFlag.mjVIS_TRANSPARENT] = transparent_robot
++        self.viewer.cam.azimuth = 180   # face robot front; user can orbit freely after this
++        self.viewer.cam.elevation = -10
+         
+         if self.record_video:
+             assert video_path is not None, "Please provide video path for recording"
+@@ -93,19 +95,23 @@ class RobotMotionViewer:
+             # Initialize renderer for video recording
+             self.renderer = mj.Renderer(self.model, height=video_height, width=video_width)
+         
+-    def step(self, 
++    def step(self,
+             # robot data
+-            root_pos, root_rot, dof_pos, 
++            root_pos, root_rot, dof_pos,
+             # human data
+-            human_motion_data=None, 
++            human_motion_data=None,
+             show_human_body_name=False,
+             # scale for human point visualization
+             human_point_scale=0.1,
+-            # human pos offset add for visualization    
++            # human pos offset add for visualization
+             human_pos_offset=np.array([0.0, 0.0, 0]),
+             # rate limit
+-            rate_limit=True, 
++            rate_limit=True,
+             follow_camera=True,
++            # draw world origin XYZ axes (red=X, green=Y, blue=Z)
++            show_world_frame=False,
++            # draw labeled spheres at every robot body
++            show_robot_joint_labels=False,
+             ):
+         """
+         by default visualize robot motion.
+@@ -126,22 +132,43 @@ class RobotMotionViewer:
+         if follow_camera:
+             self.viewer.cam.lookat = self.data.xpos[self.model.body(self.robot_base).id]
+             self.viewer.cam.distance = self.viewer_cam_distance
+-            self.viewer.cam.elevation = -10  # 正面视角，轻微向下看
+-            # self.viewer.cam.azimuth = 180    # 正面朝向机器人
++            # elevation and azimuth set once at init; only lookat/distance updated here
+         
+-        if human_motion_data is not None:
++        if human_motion_data is not None or show_world_frame or show_robot_joint_labels:
+             # Clean custom geometry
+             self.viewer.user_scn.ngeom = 0
+-            # Draw the task targets for reference
+-            for human_body_name, (pos, rot) in human_motion_data.items():
+-                draw_frame(
+-                    pos,
+-                    R.from_quat(rot, scalar_first=True).as_matrix(),
+-                    self.viewer,
+-                    human_point_scale,
+-                    pos_offset=human_pos_offset,
+-                    joint_name=human_body_name if show_human_body_name else None
++
++            if show_world_frame:
++                # World origin: red=X, green=Y, blue=Z
++                draw_frame(np.zeros(3), np.eye(3), self.viewer, size=0.3, joint_name="world")
++
++            if show_robot_joint_labels:
++                for body_id in range(1, self.model.nbody):  # skip world body (id=0)
++                    body_name = self.model.body(body_id).name
++                    body_pos = self.data.xpos[body_id].copy()
++                    geom = self.viewer.user_scn.geoms[self.viewer.user_scn.ngeom]
++                    mj.mjv_initGeom(
++                        geom,
++                        type=mj.mjtGeom.mjGEOM_SPHERE,
++                        size=[0.015, 0.015, 0.015],
++                        pos=body_pos,
++                        mat=np.eye(3).flatten(),
++                        rgba=np.array([1.0, 1.0, 0.0, 0.8]),
+                     )
++                    geom.label = body_name
++                    self.viewer.user_scn.ngeom += 1
++
++            if human_motion_data is not None:
++                # Draw the task targets for reference
++                for human_body_name, (pos, rot) in human_motion_data.items():
++                    draw_frame(
++                        pos,
++                        R.from_quat(rot, scalar_first=True).as_matrix(),
++                        self.viewer,
++                        human_point_scale,
++                        pos_offset=human_pos_offset,
++                        joint_name=human_body_name if show_human_body_name else None
++                        )
+ 
+         self.viewer.sync()
+         if rate_limit is True:
+diff --git a/general_motion_retargeting/utils/lafan1.py b/general_motion_retargeting/utils/lafan1.py
+index c4f9641..1f5c0d5 100644
+--- a/general_motion_retargeting/utils/lafan1.py
++++ b/general_motion_retargeting/utils/lafan1.py
+@@ -17,7 +17,12 @@ def load_bvh_file(bvh_file, format="lafan1"):
+     data = read_bvh(bvh_file)
+     global_data = utils.quat_fk(data.quats, data.pos, data.parents)
+ 
+-    rotation_matrix = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
++    # Blender BVH is Z-up (same as MuJoCo) — identity rotation, just scale.
++    # LAFAN1/Nokov BVH is Y-up — rotate to convert Y-up → Z-up.
++    if format in ("blender", "qtm"):
++        rotation_matrix = np.eye(3)
++    else:
++        rotation_matrix = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
+     rotation_quat = R.from_matrix(rotation_matrix).as_quat(scalar_first=True)
+ 
+     frames = []
+@@ -27,7 +32,7 @@ def load_bvh_file(bvh_file, format="lafan1"):
+             orientation = utils.quat_mul(rotation_quat, global_data[0][frame, i])
+             position = global_data[1][frame, i] @ rotation_matrix.T / 100  # cm to m
+             result[bone] = [position, orientation]
+-            
++
+         if format == "lafan1":
+             # Add modified foot pose
+             result["LeftFootMod"] = [result["LeftFoot"][0], result["LeftToe"][1]]
+@@ -35,6 +40,9 @@ def load_bvh_file(bvh_file, format="lafan1"):
+         elif format == "nokov":
+             result["LeftFootMod"] = [result["LeftFoot"][0], result["LeftToeBase"][1]]
+             result["RightFootMod"] = [result["RightFoot"][0], result["RightToeBase"][1]]
++        elif format in ("blender", "qtm"):
++            result["LeftFootMod"] = [result["LeftFoot"][0], result["LeftToeBase"][1]]
++            result["RightFootMod"] = [result["RightFoot"][0], result["RightToeBase"][1]]
+         else:
+             raise ValueError(f"Invalid format: {format}")
+             

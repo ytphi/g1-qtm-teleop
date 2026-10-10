@@ -1,35 +1,117 @@
-# Qualisys FBX → Unitree G1
+# QTM Teleop G1
 
-Convert motion capture recordings from **Qualisys Track Manager (QTM)** into **Unitree G1 humanoid robot joint angles**, ready for simulation or robot playback.
+Drive a **Unitree G1 humanoid** from a person moving in a **Qualisys** motion capture studio — live, through the **Qualisys Track Manager (QTM)** real-time stream — or retarget recorded QTM sessions offline.
 
 Developed at **California State University, San Bernardino (CSUSB)** — Robotics Lab.
 
+| Mode | Input | Output | Entry point |
+|---|---|---|---|
+| **Live teleop** | QTM real-time skeleton stream | G1 joint commands at 100 Hz (or a MuJoCo preview) + recorded episodes | `scripts/teleop_session.py` |
+| **Offline retargeting** | FBX export from QTM | `.pkl` joint-angle sequence | `fbx_to_g1.py` |
+
+> **Status:** live teleop has been tested end-to-end against a live QTM stream in **dry-run mode** (MuJoCo viewer, no robot): 24/24 skeleton segments, ~5 ms median stream latency, arm and torso directions matching the actor within a few degrees. **It has not yet been run on the physical robot.**
+
 ---
 
-## What This Does
+## Install
 
-When you record a person moving in the Qualisys motion capture lab, QTM tracks reflective markers placed on their body and fits a skeleton model to them. You can export that skeleton animation as an **FBX file**.
+```bash
+git clone https://github.com/ytphi/qtm-teleop-g1.git
+cd qtm-teleop-g1
+bash setup.sh
+```
 
-This tool takes that FBX file and converts it into a sequence of **robot joint angles** — the exact motor positions the Unitree G1 humanoid would need to replicate the same movement. You can then preview the result in a 3D simulator (MuJoCo) and save it for robot deployment or AI training.
+`setup.sh` installs the Python packages, clones [GMR](https://github.com/YanjieZe/GMR) into `GMR/` at a pinned commit, and applies `gmr_patch/` — QTM IK configs plus small fixes that GMR needs for QTM skeletons. Python 3.10+ is recommended.
+
+To drive the real robot you also need [unitree_sdk2_python](https://github.com/unitreerobotics/unitree_sdk2_python). Dry runs work without it.
+
+---
+
+# Live teleop
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                        WORKFLOW OVERVIEW                         │
-├──────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│   Qualisys Lab          This Tool               Output           │
-│                                                                  │
-│  Person moves    →   FBX file (.fbx)   →  Robot joint angles    │
-│  in capture          exported from          saved as .pkl        │
-│  volume              QTM software           viewable in          │
-│                                             MuJoCo sim           │
-│                                                                  │
-│           Step A              Step B              Step C         │
-│        Export FBX          Run script          Visualize         │
-│        from QTM            (automatic)         or deploy         │
-│                                                                  │
-└──────────────────────────────────────────────────────────────────┘
+ Qualisys studio            this repo                                          G1
+┌──────────────┐  QTM RT  ┌─────────────┐  ┌────────────┐  ┌────────┐  DDS   ┌───────────┐
+│ actor + QTM  │ ───────► │ qtm_stream  │─►│ retarget   │─►│ safety │ ─────► │ 29 DOF    │
+│ AIM skeleton │  22223   │ 24 segments │  │ GMR IK or  │  │ filter │ 100 Hz │ low-level │
+└──────────────┘          └─────────────┘  │ geometric  │  └────────┘        └───────────┘
+                                           └────────────┘      │
+                                                               └─► episode recorder (HDF5)
 ```
+
+## 1. Set up QTM
+
+- Fit the AIM skeleton to the actor and keep QTM in **preview or capture** so it streams.
+- Turn on **real-time skeleton output**.
+- Use port **22223**. On QTM 2024.2, port 22222 accepts the connection but only speaks the legacy RT protocol 1.0, so `qtm_rt` hangs silently.
+
+## 2. Configure
+
+Edit `config/teleop.yaml`:
+
+```yaml
+robot:
+  network_interface: "eth0"   # NIC wired to the G1 (check with `ip link`)
+qtm:
+  ip: "192.168.0.1"           # QTM PC
+  port: 22223
+  skeleton_name: "Actor1"     # skeleton name in QTM
+safety:
+  max_joint_vel: 1.0          # rad/s per joint; lower = gentler
+  qtm_timeout: 0.2            # s; older mocap data → hold pose
+  limit_margin: 0.05          # rad inside URDF joint limits
+```
+
+## 3. Dry run first (no robot)
+
+```bash
+python scripts/teleop_session.py --dry-run --retargeter gmr
+```
+
+QTM → retargeting → safety filter → a MuJoCo viewer showing the G1. Check that the robot mirrors the actor before going near hardware.
+
+## 4. Run on the robot
+
+```bash
+python scripts/teleop_session.py --retargeter gmr
+```
+
+> ⚠️ This **releases the G1's own balance controller** and commands every joint directly. The robot must hang on a **gantry** with a **safety operator holding the remote**. The script asks you to type `yes` before it starts.
+
+The laptop needs two wired connections — one to the QTM network, one to the G1 — so a USB Ethernet adapter is usually needed.
+
+### Keyboard controls
+
+| Key | Action |
+|---|---|
+| `s` | start recording an episode |
+| `e` | end and save the episode |
+| `d` | discard the current episode |
+| `p` | pause / resume (robot holds its pose) |
+| `q` | quit: ramp to zero → damping → motors off |
+
+`Ctrl-C` does the same safe shutdown; press it twice to skip the ramp.
+
+### Safety filter (`teleop/safety.py`)
+
+- Every command is clamped to the URDF joint limits (minus a margin) and rate-limited to `max_joint_vel`.
+- Mocap data older than `qtm_timeout`, or with NaN segments → hold the last command.
+- Retargeter errors or NaN output → hold the last command.
+
+### Retargeters
+
+| `--retargeter` | How it works | Notes |
+|---|---|---|
+| `gmr` | IK with [GMR](https://github.com/YanjieZe/GMR) (mink + MuJoCo), `qtm_rt` config | recommended; tested on live QTM data |
+| `geometric` (default) | joint angles from relative rotations between adjacent QTM segments | no IK, lighter; not yet compared against GMR live |
+
+Recorded episodes are saved as HDF5 under `episodes/` (joint commands, robot state, IMU, mocap segment poses and, on the real robot, the head-camera image).
+
+---
+
+# Offline retargeting: FBX recordings
+
+Convert a recorded QTM session, exported as **FBX**, into G1 joint angles you can preview in MuJoCo or use as training data.
 
 **Under the hood**, the script:
 1. Runs **Blender** in the background (no window opens) to read the FBX skeleton data
@@ -39,7 +121,7 @@ This tool takes that FBX file and converts it into a sequence of **robot joint a
 
 ---
 
-## Requirements
+### Requirements
 
 | Software | Version | Why needed |
 |---|---|---|
@@ -51,16 +133,16 @@ You also need a **Qualisys FBX export** — see the section below for exact expo
 
 ---
 
-## Step A — Export FBX from Qualisys Track Manager
+### Step A — Export FBX from Qualisys Track Manager
 
 > **Do this on the Qualisys lab computer before you leave the lab.**
 > You need QTM open with your recording loaded.
 
-### What format does this tool expect?
+#### What format does this tool expect?
 
 Your FBX must be a **skeleton (bone) animation** — not raw marker data. QTM's AIM skeleton model must be fitted to your recording before export.
 
-### Export steps (QTM 2023 or newer)
+#### Export steps (QTM 2023 or newer)
 
 **1. Open your recording in QTM**
 
@@ -99,11 +181,11 @@ Set the following options (leave everything else at default):
 
 Click **Export**. QTM will create a `.fbx` file. Copy this file to your laptop (USB drive or network share).
 
-### What if my FBX has an actor prefix on bone names?
+#### What if my FBX has an actor prefix on bone names?
 
 QTM sometimes names bones like `Joseph:Hips` instead of just `Hips`. This is called an **actor namespace prefix**. The script strips it automatically — you don't need to do anything.
 
-### Checking your FBX before running
+#### Checking your FBX before running
 
 You can quickly verify the FBX is a skeleton export (not raw markers) by opening it in Blender manually:
 1. Open Blender → **File → Import → FBX**
@@ -113,16 +195,16 @@ You can quickly verify the FBX is a skeleton export (not raw markers) by opening
 
 ---
 
-## Step B — Install and Run
+### Step B — Install and Run
 
-### 1. Clone this repository
+#### 1. Clone this repository
 
 ```bash
-git clone https://github.com/csusb-robotics/qualisys-fbx-to-g1.git
-cd qualisys-fbx-to-g1
+git clone https://github.com/ytphi/qtm-teleop-g1.git
+cd qtm-teleop-g1
 ```
 
-### 2. Run the setup script
+#### 2. Run the setup script
 
 ```bash
 bash setup.sh
@@ -138,7 +220,7 @@ sudo snap install blender --classic
 # Or download from blender.org and add to PATH
 ```
 
-### 3. Retarget your FBX
+#### 3. Retarget your FBX
 
 ```bash
 # Retarget a single file and open the MuJoCo viewer
@@ -174,7 +256,7 @@ Step 1 (Blender) takes 10–30 seconds for a typical 30-second recording. Step 3
 
 ---
 
-## Step C — Visualize
+### Step C — Visualize
 
 If you used `--no-viz` earlier, or want to re-watch the result:
 
@@ -192,7 +274,7 @@ python visualize.py output/your_recording.pkl --record --video my_motion.mp4
 
 ---
 
-## Output File Format
+### Output File Format
 
 The `.pkl` file saved by `fbx_to_g1.py` is a Python pickle containing:
 
@@ -223,15 +305,15 @@ print(data["fps"])             # 50.0
 
 ---
 
-## Troubleshooting
+### Troubleshooting
 
-### "No armature found in FBX"
+#### "No armature found in FBX"
 
 The FBX does not contain a skeleton. Go back to Step A and make sure:
 - The AIM skeleton is fitted in QTM before export
 - "Skeleton" is checked in the FBX export dialog
 
-### "blender: command not found"
+#### "blender: command not found"
 
 Blender is not on your PATH. After installing, you may need:
 ```bash
@@ -242,22 +324,22 @@ export PATH="/snap/bin:$PATH"
 which blender   # find where it is
 ```
 
-### Hips height is much less than 0.85 m (e.g. 0.009 m)
+#### Hips height is much less than 0.85 m (e.g. 0.009 m)
 
 The FBX was exported in **centimetres** instead of metres. In the QTM export dialog, set **Units → Meters**. If you cannot re-export, you can patch the script: find `pos_mj = [-by, bx, bz]` in `fbx_to_g1.py` and change it to `pos_mj = [-by/100, bx/100, bz/100]`.
 
-### The robot motion looks mirrored left-right
+#### The robot motion looks mirrored left-right
 
 Check that the person was facing toward the **+X axis** (or any consistent direction) in the QTM lab. The script auto-corrects yaw but assumes the skeleton is upright. If the actor was walking sideways at capture start, the correction may flip.
 
-### Retargeting is very slow
+#### Retargeting is very slow
 
 The default setting runs 50 IK iterations per frame for accuracy. For a quick preview, you can reduce this by editing `fbx_to_g1.py`:
 ```python
 retargeter.max_iter = 50   # change to 10 for faster (less accurate) results
 ```
 
-### ImportError: No module named 'general_motion_retargeting'
+#### ImportError: No module named 'general_motion_retargeting'
 
 Run `bash setup.sh` again. If the problem persists:
 ```bash
@@ -272,15 +354,23 @@ python -c "import general_motion_retargeting; print('OK')"
 ## Project Structure
 
 ```
-qualisys-fbx-to-g1/
-├── fbx_to_g1.py      ← main pipeline: FBX → .pkl
-├── visualize.py      ← MuJoCo playback of .pkl files
-├── setup.sh          ← one-command install
-├── requirements.txt  ← Python dependencies
-└── README.md         ← this file
+qtm-teleop-g1/
+├── scripts/teleop_session.py   ← live teleop entry point
+├── teleop/
+│   ├── qtm_stream.py           ← QTM real-time skeleton client
+│   ├── gmr_retarget.py         ← GMR IK retargeter (qtm_rt config)
+│   ├── retarget.py             ← geometric retargeter + G1 joint names/limits
+│   ├── safety.py               ← joint-limit clamp, rate limit, stale-data hold
+│   ├── robot_control.py        ← G1 low-level DDS commands (unitree_sdk2py)
+│   └── live_viewer.py          ← MuJoCo preview for --dry-run
+├── record/episode_writer.py    ← HDF5 episode recorder
+├── config/teleop.yaml          ← network, QTM and safety settings
+├── fbx_to_g1.py                ← offline: FBX → .pkl
+├── visualize.py                ← offline: MuJoCo playback of .pkl files
+├── gmr_patch/                  ← QTM IK configs + GMR fixes, applied by setup.sh
+├── setup.sh                    ← one-command install
+└── requirements.txt
 ```
-
-The GMR library is cloned into a `GMR/` subfolder by `setup.sh`.
 
 ---
 
@@ -302,5 +392,6 @@ This is the same approach used in professional animation pipelines for retargeti
 ## Credits
 
 - **GMR** retargeting engine: [YanjieZe/GMR](https://github.com/YanjieZe/GMR) — Yanjie Ze et al., arXiv:2505.02833
+- **QTM real-time SDK**: [qualisys/qualisys_python_sdk](https://github.com/qualisys/qualisys_python_sdk)
 - **Unitree G1** robot: [Unitree Robotics](https://www.unitree.com/g1/)
-- Pipeline developed by the CSUSB Robotics Lab under **Prof. Yutong Liu**
+- Developed by the CSUSB Robotics Lab under **Prof. Yutong Liu**
