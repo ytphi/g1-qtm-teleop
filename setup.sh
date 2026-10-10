@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Setup script for qtm-teleop-g1
+# Setup script for g1-qtm-teleop
 # Installs all dependencies in one shot.
 
 set -e  # stop on first error

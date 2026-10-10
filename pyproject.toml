@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qtm-teleop-g1"
+version = "0.1.0"
+description = "Live teleoperation of the Unitree G1 from Qualisys (QTM) motion capture"
+requires-python = ">=3.10"
+dependencies = ["numpy", "scipy", "pyyaml", "h5py", "opencv-python", "qtm-rt"]
+
+[tool.setuptools]
+packages = ["teleop", "record"]

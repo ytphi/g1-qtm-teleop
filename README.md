@@ -16,12 +16,14 @@ Developed at **California State University, San Bernardino (CSUSB)** — Robotic
 ## Install
 
 ```bash
-git clone https://github.com/ytphi/qtm-teleop-g1.git
-cd qtm-teleop-g1
+git clone https://github.com/ytphi/g1-qtm-teleop.git
+cd g1-qtm-teleop
 bash setup.sh
 ```
 
 `setup.sh` installs the Python packages, clones [GMR](https://github.com/YanjieZe/GMR) into `GMR/` at a pinned commit, and applies `gmr_patch/` — QTM IK configs plus small fixes that GMR needs for QTM skeletons. Python 3.10+ is recommended.
+
+To use the modules from another project (e.g. `g1-sb01` imports `teleop.safety`), install the repo in that environment: `pip install -e .`
 
 To drive the real robot you also need [unitree_sdk2_python](https://github.com/unitreerobotics/unitree_sdk2_python). Dry runs work without it.
 
@@ -200,8 +202,8 @@ You can quickly verify the FBX is a skeleton export (not raw markers) by opening
 #### 1. Clone this repository
 
 ```bash
-git clone https://github.com/ytphi/qtm-teleop-g1.git
-cd qtm-teleop-g1
+git clone https://github.com/ytphi/g1-qtm-teleop.git
+cd g1-qtm-teleop
 ```
 
 #### 2. Run the setup script
@@ -354,7 +356,7 @@ python -c "import general_motion_retargeting; print('OK')"
 ## Project Structure
 
 ```
-qtm-teleop-g1/
+g1-qtm-teleop/
 ├── scripts/teleop_session.py   ← live teleop entry point
 ├── teleop/
 │   ├── qtm_stream.py           ← QTM real-time skeleton client
@@ -369,6 +371,7 @@ qtm-teleop-g1/
 ├── visualize.py                ← offline: MuJoCo playback of .pkl files
 ├── gmr_patch/                  ← QTM IK configs + GMR fixes, applied by setup.sh
 ├── setup.sh                    ← one-command install
+├── pyproject.toml              ← makes teleop/ and record/ pip-installable
 └── requirements.txt
 ```
 
