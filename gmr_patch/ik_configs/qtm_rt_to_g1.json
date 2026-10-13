@@ -25,7 +25,7 @@
         "pelvis": [
             "Hips",
             0,
-            10,
+            300,
             [
                 0.0,
                 0.0,
@@ -251,7 +251,7 @@
         "pelvis": [
             "Hips",
             100,
-            5,
+            300,
             [
                 0.0,
                 0.0,
@@ -473,5 +473,6 @@
             ]
         ]
     },
-    "_note": "QTM real-time skeleton (QTM 2024.2): in T-pose every segment has the Hips orientation, so rot offset = pelvis alignment * G1 body orientation in T-pose (shoulder roll +-pi/2, elbow 1.431 = straight). Generated 2026-10-08; BVH config untouched."
+    "_note": "QTM real-time skeleton (QTM 2024.2): in T-pose every segment has the Hips orientation, so rot offset = pelvis alignment * G1 body orientation in T-pose (shoulder roll +-pi/2, elbow 1.431 = straight). Generated 2026-10-08; BVH config untouched.",
+    "_note_pelvis_weight": "pelvis rot weight 10/5 -> 300/300 (2026-10-13): with low weight the IK pitched the whole body to match the high-weight (100) shoulder orientation when the arms swung forward: pelvis tilt up to 72 deg vs 18 deg human trunk lean on a QTM playback loop; 300/300 gives max 16 deg, arm direction error unchanged."
 }

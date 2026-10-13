@@ -72,6 +72,8 @@ python scripts/teleop_session.py --dry-run --retargeter gmr
 
 QTM → retargeting → safety filter → a MuJoCo viewer showing the G1. Check that the robot mirrors the actor before going near hardware.
 
+By default the viewer's pelvis is fixed, as it is on the gantry. To see whole-body motion, add `--float-base` (dry run + `gmr` only): the pelvis follows GMR's root pose and the feet are kept on the ground. This is a kinematic preview with no physics or balance.
+
 ## 4. Run on the robot
 
 ```bash
@@ -80,7 +82,7 @@ python scripts/teleop_session.py --retargeter gmr
 
 > ⚠️ This **releases the G1's own balance controller** and commands every joint directly. The robot must hang on a **gantry** with a **safety operator holding the remote**. The script asks you to type `yes` before it starts.
 
-The laptop needs two wired connections — one to the QTM network, one to the G1 — so a USB Ethernet adapter is usually needed.
+The laptop needs wired connections to both the QTM PC and the G1. Wi-Fi to QTM showed ~1 s stalls, and the robot holds its pose during each one. One cable can carry both subnets if the QTM network and the G1 share a switch. Add a second address to the port, e.g. `nmcli connection modify <profile> +ipv4.addresses 192.168.0.250/24` next to the G1's `192.168.123.x`. Otherwise use a USB Ethernet adapter.
 
 ### Keyboard controls
 
@@ -107,7 +109,7 @@ The laptop needs two wired connections — one to the QTM network, one to the G1
 | `gmr` | IK with [GMR](https://github.com/YanjieZe/GMR) (mink + MuJoCo), `qtm_rt` config | recommended; tested on live QTM data |
 | `geometric` (default) | joint angles from relative rotations between adjacent QTM segments | no IK, lighter; not yet compared against GMR live |
 
-Recorded episodes are saved as HDF5 under `episodes/` (joint commands, robot state, IMU, mocap segment poses and, on the real robot, the head-camera image).
+Recorded episodes are saved as HDF5 under `episodes/` (joint commands, robot state, IMU, mocap segment poses). `recording.obs_image` is off by default: it reads `cv2` device 0, which is the laptop's own camera, not the G1 head camera.
 
 ---
 

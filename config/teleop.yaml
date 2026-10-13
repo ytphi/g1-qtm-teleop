@@ -1,17 +1,17 @@
 robot:
   ip: "192.168.123.1"       # G1 default; change if different
-  network_interface: "eth0" # interface connected to G1; check with `ip link`
+  network_interface: "eno0" # interface connected to G1 (192.168.123.222 on this laptop); check with `ip -br addr`
   control_freq: 100         # Hz
   dof: 29                   # confirmed 29-DOF G1 U2
 
 qtm:
-  ip: "192.168.0.1"         # QTM PC IP
+  ip: "192.168.0.1"         # QTM PC camera-network NIC; laptop eno0 has 192.168.0.250 (wired)
   port: 22223               # qtm_rt needs 22223; 22222 on QTM 2024.2 is legacy protocol 1.0 only (hangs)
   skeleton_name: "Actor1"   # name assigned in QTM skeleton setup
 
 recording:
   save_dir: "./episodes"
-  obs_image: true           # G1 head camera
+  obs_image: false          # true records cv2 device 0 = this LAPTOP's webcam, not the G1 head camera
   image_size: [640, 480]
 
 safety:

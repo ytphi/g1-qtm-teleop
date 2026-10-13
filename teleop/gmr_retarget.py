@@ -31,6 +31,8 @@ class GMRRetargeter:
         self._retargeter = None
         self._human_height = human_height
         self._dof_index = None   # qpos index for each motor, in G1_JOINT_NAMES order
+        self.root_pos = None     # last pelvis position (3,) m; the real robot can't follow it
+        self.root_rot = None     # last pelvis orientation (w, x, y, z)
 
     def setup(self) -> None:
         if not GMR_ROOT.exists():
@@ -71,5 +73,6 @@ class GMRRetargeter:
                 human_data[f"{side}FootMod"] = [human_data[f"{side}Foot"][0],
                                                 human_data[f"{side}ToeBase"][1]]
 
-        qpos = self._retargeter.retarget(human_data, offset_to_ground=False)
-        return np.asarray(qpos)[self._dof_index]
+        qpos = np.asarray(self._retargeter.retarget(human_data, offset_to_ground=False))
+        self.root_pos, self.root_rot = qpos[:3].copy(), qpos[3:7].copy()
+        return qpos[self._dof_index]

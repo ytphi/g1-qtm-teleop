@@ -123,7 +123,12 @@ def main():
                         help="geometric = rule-based (default); gmr = IK-based (YanjieZe/GMR)")
     parser.add_argument("--dry-run", action="store_true",
                         help="no robot: run QTM → retarget → safety filter into a MuJoCo viewer")
+    parser.add_argument("--float-base", action="store_true",
+                        help="dry run + gmr only: move the viewer's pelvis with the actor, feet kept on the "
+                             "ground (the real robot can't — its pelvis hangs on the gantry)")
     args = parser.parse_args()
+    if args.float_base and not (args.dry_run and args.retargeter == "gmr"):
+        parser.error("--float-base needs --dry-run --retargeter gmr")
     os.chdir(REPO_ROOT)   # config + episodes paths are repo-relative, wherever this is run from
 
     cfg = load_config(args.config)
@@ -173,7 +178,7 @@ def main():
     if args.dry_run:
         robot = DryRunRobot()
         from teleop.live_viewer import LiveViewer
-        viewer = LiveViewer(fps=control_freq)
+        viewer = LiveViewer(fps=control_freq, camera_follow=args.float_base, ground_feet=args.float_base)
         viewer.start()
     else:
         from teleop.robot_control import G1RobotControl
@@ -269,7 +274,10 @@ def main():
                 warn("nonfinite", "[SAFE] retarget produced NaN/inf — holding pose")
             robot.set_joint_positions(action)
             if viewer is not None:
-                viewer.update(action)
+                if args.float_base:
+                    viewer.update(action, retargeter.root_pos, retargeter.root_rot)
+                else:
+                    viewer.update(action)
 
             # ── observe ──
             qpos    = robot.joint_positions
