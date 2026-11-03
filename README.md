@@ -235,23 +235,38 @@ python fbx_to_g1.py your_recording.fbx --out-dir output/ --no-viz
 
 # Retarget an entire folder of FBX files
 python fbx_to_g1.py /path/to/fbx_folder/ --out-dir output/
+
+# Set the actor's real height (used to scale the human to the G1)
+python fbx_to_g1.py your_recording.fbx --height 1.62 --out-dir output/ --no-viz
 ```
+
+| Option | Default | What it does |
+|---|---|---|
+| `--height` | 1.68 | Actor height in metres. GMR scales the human to the G1 with it. |
+| `--fps` | read from FBX | Override the frame rate if the FBX doesn't carry the QTM capture rate. |
+| `--max-joint-speed` | 15 | rad/s. GMR sometimes jumps to a new joint solution in one frame (often at a wrist limit); faster jumps are turned into short ramps. |
+| `--no-clean` | off | Keep those IK jumps. |
+| `--no-ground` | off | Don't shift the root height so the soles touch the floor. |
+
+> Files made before this version always say `fps: 50` in the `.pkl`. QTM exports at 100 Hz, so they play at half speed in training. Re-convert them.
 
 **What you will see in the terminal:**
 
 ```
 Found 1 FBX file(s)
 
-[your_recording]
+[Rev_Patrol01]
   Step 1/3  Extracting bone transforms via Blender (takes ~10-30s) ...
-  Facing correction: 34.2° → normalised to 0°
   Step 2/3  Loading and converting coordinate frames ...
-  Bones (21): ['Hips', 'Spine', 'Spine1', 'Spine2', 'Neck'] ...
-  Frames: 1500
-  Hips height[0]: 0.847 m  (expected ~0.85 m)
+  Facing correction: 178.7° → normalised to 0°
+  Bones (24): ['Hips', 'Spine', 'Spine1', 'Spine2', 'Neck'] ...
+  Frames: 4907 at 100 fps (from FBX) = 49.1 s
+  Hips height[0]: 0.829 m  (expected ~0.85 m)
+  Head joint[0]: 1.448 m  (actor height used for scaling: 1.68 m; set with --height)
   Step 3/3  Running GMR retargeting ...
-  retargeting: 100%|████████████████| 1500/1500 [01:20<00:00, 18.6it/s]
-  Saved → output/your_recording.pkl
+  IK glitch repair: 0 flip frames interpolated, 95 jumps ramped; max joint speed 154 → 14.5 rad/s (p99 3.5)
+  Ground: shifted root by +6.7 cm; lowest sole per frame now -10.4 to +5.5 cm (5-95%: -4.1 to +2.9)
+  Saved → output/Rev_Patrol01.pkl
 
 Done.
 ```
