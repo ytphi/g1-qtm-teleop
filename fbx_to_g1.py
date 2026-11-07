@@ -5,8 +5,13 @@ Steps performed automatically:
   1. Run Blender headless to extract per-frame bone world transforms from FBX
   2. Strip actor namespace prefix (e.g. "Joseph:Hips" → "Hips")
   3. Auto-correct initial facing direction so the robot always starts forward
-  4. Retarget each frame → G1 joint angles using GMR IK
-  5. Save as .pkl and optionally visualize in MuJoCo
+  4. Retarget each frame → G1 joint angles using GMR IK (scaled by --height)
+  5. Ramp out single-frame IK jumps (--no-clean to skip)
+  6. Shift the root so the G1's soles touch the floor (--no-ground to skip)
+  7. Save as .pkl, with the FBX's real frame rate, and optionally visualize in MuJoCo
+
+Earlier versions always wrote fps=50 to the .pkl. QTM exports at the capture rate
+(usually 100 Hz), so those files play at half speed downstream: re-convert them.
 
 Usage:
     # Retarget a single FBX file and visualize
@@ -52,18 +57,32 @@ out_path  = "{out_path}"
 
 bpy.ops.import_scene.fbx(filepath=fbx_path)
 
-arm_obj = next((o for o in bpy.data.objects if o.type == "ARMATURE"), None)
-if arm_obj is None:
+arms = [o for o in bpy.data.objects if o.type == "ARMATURE"]
+if not arms:
     print("ERROR: no armature found in FBX"); sys.exit(1)
+
+# QTM exports a rigid body (e.g. the chair, 6DOF) as its own one-bone armature next to the
+# actor's skeleton. The actor is the armature with a Hips bone (else: the most bones).
+def has_hips(o): return any(b.name.split(":")[-1] == "Hips" for b in o.data.bones)
+arm_obj = max(arms, key=lambda o: (has_hips(o), len(o.data.bones)))
+props   = [o for o in arms if o is not arm_obj]
+print(f"Actor armature: {{arm_obj.name}}; rigid bodies: {{[o.name for o in props]}}")
 
 bpy.context.view_layer.objects.active = arm_obj
 scene  = bpy.context.scene
 bone_names = [b.name for b in arm_obj.data.bones]
+# Rest-pose world orientation of each bone: exporters differ in how bone axes are laid out
+# (QTM: every bone Rz(180°); many animation exports: Rx(90°)), which the loader evens out.
+W_rot = arm_obj.matrix_world.to_quaternion()
+rest_rot = []
+for b in arm_obj.data.bones:
+    q = W_rot @ b.matrix_local.to_quaternion()
+    rest_rot.append([q.w, q.x, q.y, q.z])
 
-# Use the action keyframe range — QTM FBX files often have 3000+ frames,
-# so the scene start/end defaults may be wrong.
+# Use the action's keyframe range: the scene's start/end defaults (1-250) are unrelated
+# to the clip and are too short or too long for most QTM exports.
 action = arm_obj.animation_data.action if arm_obj.animation_data else None
-if action and action.frame_range[1] > scene.frame_end:
+if action:
     frame_start = int(action.frame_range[0])
     frame_end   = int(action.frame_range[1])
     print(f"Using action frame range: {{frame_start}}–{{frame_end}} ({{frame_end - frame_start + 1}} frames)")
@@ -74,6 +93,8 @@ else:
 
 positions    = []
 orientations = []
+prop_pos = {{o.name.split(":")[0]: [] for o in props}}
+prop_rot = {{o.name.split(":")[0]: [] for o in props}}
 
 for f in range(frame_start, frame_end + 1):
     scene.frame_set(f)
@@ -87,12 +108,26 @@ for f in range(frame_start, frame_end + 1):
         rot_row.append([quat.w, quat.x, quat.y, quat.z])
     positions.append(pos_row)
     orientations.append(rot_row)
+    for o in props:                                  # root bone of each rigid body
+        mat = o.matrix_world @ o.pose.bones[0].matrix
+        q = mat.to_quaternion()
+        prop_pos[o.name.split(":")[0]].append(list(mat.translation))
+        prop_rot[o.name.split(":")[0]].append([q.w, q.x, q.y, q.z])
+
+# The FBX importer sets the scene frame rate from the file (QTM exports at the capture rate,
+# typically 100 Hz). Without it, frame counts can't be converted to seconds.
+fps = scene.render.fps / scene.render.fps_base
 
 np.savez(out_path,
          positions=np.array(positions,    dtype=np.float32),  # (T, B, 3)
          orientations=np.array(orientations, dtype=np.float32),  # (T, B, 4) wxyz
-         bone_names=np.array(bone_names))
-print(f"Saved {{len(positions)}} frames, {{len(bone_names)}} bones → {{out_path}}")
+         bone_names=np.array(bone_names),
+         rest_rot=np.array(rest_rot, dtype=np.float64),          # (B, 4) wxyz
+         fps=np.float64(fps),
+         prop_names=np.array(list(prop_pos)),
+         **{{"prop_pos_" + k: np.array(v, dtype=np.float32) for k, v in prop_pos.items()}},
+         **{{"prop_rot_" + k: np.array(v, dtype=np.float32) for k, v in prop_rot.items()}})
+print(f"Saved {{len(positions)}} frames at {{fps:g}} fps, {{len(bone_names)}} bones → {{out_path}}")
 '''
 
 
@@ -116,19 +151,60 @@ def fbx_to_npz(fbx_path: str, npz_path: str) -> bool:
     return os.path.exists(actual)
 
 
-def load_npz_as_human_data(npz_path: str):
+def load_npz_as_human_data(npz_path: str, start: float = 0.0, end: float | None = None,
+                           fps_override: float | None = None):
     """
     Load Blender-extracted transforms and convert to GMR human_data format.
 
+    - Trims to [start, end) seconds first, so the facing correction uses the first kept frame
+      (not a T-pose at the start of the take)
     - Strips actor namespace prefix (e.g. "Joseph:Hips" → "Hips")
     - Auto-corrects initial facing direction (yaw normalisation)
     - Converts Blender Z-up to MuJoCo Z-up (coordinate flip -Y→+X)
     - Adds LeftFootMod / RightFootMod synthetic bones for GMR IK config
+    - Rigid bodies (e.g. the chair) get the same yaw + axis change: {name: (pos, quat_wxyz)}
     """
     data = np.load(npz_path, allow_pickle=True)
+    fps          = fps_override or (float(data["fps"]) if "fps" in data else None)
     positions    = data["positions"]                              # (T, B, 3)
     orientations = data["orientations"]                          # (T, B, 4) wxyz
     bone_names   = [str(n).split(":")[-1] for n in data["bone_names"]]
+    # Rigid-body names are lower-cased: QTM takes call the same chair "Chair" or "chair".
+    props = {str(k).lower(): (data["prop_pos_" + str(k)], data["prop_rot_" + str(k)])
+             for k in data["prop_names"]} if "prop_names" in data else {}
+
+    # Bone axes: GMR's fbx_qtm config expects QTM's convention, where every bone's rest
+    # orientation is Rz(180°). Other skeletons are re-expressed in it, bone by bone:
+    # q' = q · rest⁻¹ · Rz(180°). QTM files (Hips rest within 1° of Rz(180°)) are left as they are.
+    if "rest_rot" in data and "Hips" in bone_names:
+        qtm_rest = R.from_euler("z", 180, degrees=True)
+        rest = R.from_quat(data["rest_rot"][:, [1, 2, 3, 0]])
+        if (rest[bone_names.index("Hips")].inv() * qtm_rest).magnitude() > np.radians(1):
+            corr = rest.inv() * qtm_rest                              # one per bone
+            T, B = orientations.shape[:2]
+            q = R.from_quat(orientations.reshape(-1, 4)[:, [1, 2, 3, 0]])
+            q = q * R.concatenate([corr] * T)
+            orientations = q.as_quat().reshape(T, B, 4)[..., [3, 0, 1, 2]]
+            e = rest[bone_names.index("Hips")].as_euler("xyz", degrees=True)
+            print(f"  Bone axes: rest pose ({e[0]:.0f}°, {e[1]:.0f}°, {e[2]:.0f}°) → re-expressed in QTM convention")
+
+    # Units: a standing adult's hips are ~0.8–1.0 m up. Some exporters write metres but also
+    # set a 0.01 armature scale (cm → m), which leaves the actor 100× too small.
+    if "Hips" in bone_names:
+        hz = float(np.median(positions[:: max(1, len(positions) // 50), bone_names.index("Hips"), 2]))
+        if 0 < abs(hz) < 0.2:
+            positions = positions * 100.0
+            props = {k: (p * 100.0, q) for k, (p, q) in props.items()}
+            print(f"  Units: hips at {hz:.3f} m → scaled ×100 (file in metres with a 0.01 armature scale)")
+
+    if start or end is not None:
+        if fps is None:
+            raise ValueError("--start/--end need the frame rate; pass --fps")
+        i0 = int(round(start * fps))
+        i1 = len(positions) if end is None else int(round(end * fps))
+        positions, orientations = positions[i0:i1], orientations[i0:i1]
+        props = {k: (p[i0:i1], q[i0:i1]) for k, (p, q) in props.items()}
+        print(f"  Trimmed to {start:g}–{(i1 / fps):g} s (frames {i0}–{i1 - 1})")
 
     # Auto-correct yaw so every recording starts facing canonical direction
     yaw_corr = R.identity()
@@ -152,6 +228,12 @@ def load_npz_as_human_data(npz_path: str):
             pos_mj = [-by, bx, bz]
             frame[bone] = [pos_mj, quat_wxyz]
 
+        # The IK config tracks the chest as "Spine2". Skeletons with fewer spine bones
+        # (e.g. Hips-Spine-Spine1-Neck) use their top spine bone for it.
+        if "Spine2" not in frame:
+            top = next((b for b in ("Spine3", "Spine1", "Spine") if b in frame), None)
+            if top:
+                frame["Spine2"] = frame[top]
         # Synthetic bones needed by the GMR IK config
         l_toe = frame.get("LeftToeBase",  frame["LeftFoot"])[1]
         r_toe = frame.get("RightToeBase", frame["RightFoot"])[1]
@@ -159,19 +241,53 @@ def load_npz_as_human_data(npz_path: str):
         frame["RightFootMod"] = [frame["RightFoot"][0], r_toe]
         frames.append(frame)
 
-    return frames, bone_names
+    # Rigid bodies: same yaw correction and the same -Y→+X axis change, applied to the
+    # orientation too (a proper rotation, unlike the bone quats GMR's config expects).
+    to_mj = R.from_euler("z", 90, degrees=True)
+    objects = {}
+    for k, (p, q) in props.items():
+        pos = to_mj.apply(yaw_corr.apply(p))
+        rot = (to_mj * yaw_corr * R.from_quat(q[:, [1, 2, 3, 0]])).as_quat()[:, [3, 0, 1, 2]]
+        objects[k] = (pos, rot)
+
+    return frames, bone_names, fps, objects
 
 
-def retarget_frames(frames):
-    """Run GMR IK on all frames and return (root_pos, root_rot, dof_pos)."""
+def warm_start(retargeter, first_frame, root="pelvis"):
+    """Put the robot's root at the first frame's root target before any IK step.
+
+    GMR starts every take from the robot's default pose. After the facing correction the
+    first target pelvis is almost exactly 180° from that pose, where the IK can't tell left
+    from right: it often stalls with the pelvis turned ~90° and hip yaw (±90°) plus waist yaw
+    (-90°) twisting the legs and chest back to the front, sometimes in a crouch. Every later
+    frame starts from the previous one, so the twist lasts the whole take (8 of 15 NoChair
+    takes on 2026-11-05).
+    """
+    retargeter.update_targets(first_frame, offset_to_ground=False)
+    task = next((t for t in retargeter.tasks1 if t.frame_name == root), None)
+    if task is None or task.transform_target_to_world is None:
+        return
+    target = task.transform_target_to_world
+    q = retargeter.configuration.q.copy()
+    q[:3] = target.translation()
+    q[3:7] = target.rotation().wxyz
+    retargeter.configuration.update(q)
+
+
+def retarget_frames(frames, human_height=1.68, src_human="fbx_qtm"):
+    """Run GMR IK on all frames and return (root_pos, root_rot, dof_pos, root_scale)."""
     retargeter = GMR(
-        src_human="fbx_qtm",
+        src_human=src_human,
         tgt_robot="unitree_g1",
         verbose=False,
         damping=0.05,
-        actual_human_height=1.68,
+        actual_human_height=human_height,
     )
     retargeter.max_iter = 50
+    # GMR scales the root translation about the world origin by this factor, so the robot
+    # covers less ground than the actor; objects must be scaled the same way to line up.
+    root_scale = float(retargeter.human_scale_table[retargeter.human_root_name])
+    warm_start(retargeter, frames[0])
     root_pos_list, root_rot_list, dof_list = [], [], []
     for human_data in tqdm(frames, desc="  retargeting", leave=False):
         qpos = retargeter.retarget(human_data, offset_to_ground=False)
@@ -182,7 +298,126 @@ def retarget_frames(frames):
         np.array(root_pos_list),
         np.array(root_rot_list),
         np.array(dof_list),
+        root_scale,
     )
+
+
+def repair_jumps(dof, fps, max_speed=15.0, max_dev=0.3):
+    """Remove IK glitches from the joint trajectories.
+
+    GMR solves each frame from the previous one, and near joint limits (often the wrists)
+    it can switch to a different solution in a single frame: a joint "teleports" by up to
+    ~1.5 rad and stays there. The mocap itself is smooth at those frames, so these jumps
+    are artefacts, and they ask the policy for impossible joint speeds.
+
+    1. Short flips (out and back within ~0.05 s) are found against a ~0.1 s running
+       median and interpolated over.
+    2. Remaining steps faster than `max_speed` rad/s are turned into linear ramps just wide
+       enough to stay under that speed, centred on the jump.
+    Normal motion stays well below both thresholds and is left untouched.
+    """
+    from scipy.signal import medfilt
+    win = max(3, int(round(0.1 * fps)) | 1)           # odd window, ~0.1 s
+    step = max_speed / fps                            # rad per frame allowed
+    dof = dof.copy()
+    t = np.arange(len(dof))
+    flips = ramps = 0
+    for j in range(dof.shape[1]):
+        q = dof[:, j]
+        bad = np.abs(q - medfilt(q, win)) > max_dev
+        if bad.any() and (~bad).sum() >= 2:
+            q[bad] = np.interp(t[bad], t[~bad], q[~bad])
+            flips += int(bad.sum())
+        for _ in range(10):                           # widen until every ramp is slow enough
+            jump = np.abs(np.diff(q)) > step * 1.001
+            if not jump.any():
+                break
+            bad = np.zeros(len(q), bool)
+            for i in np.flatnonzero(jump):
+                k = int(np.ceil(abs(q[i + 1] - q[i]) / step / 2)) + 1
+                bad[max(1, i - k + 1):min(len(q) - 1, i + k + 1)] = True
+            ramps += int(jump.sum())
+            q[bad] = np.interp(t[bad], t[~bad], q[~bad])
+    return dof, flips, ramps
+
+
+def ground_offset(root_pos, root_rot, dof):
+    """Height (m) to subtract from root z so the G1's soles touch z=0.
+
+    Runs forward kinematics on the GMR G1 model and takes, per frame, the lowest point of
+    the sole contact spheres; the median over the clip is the offset (robust to jumps and
+    to a few bad frames). GMR's own offset_to_ground shifts every frame separately,
+    which would erase real vertical motion, so it isn't used.
+    """
+    import mujoco
+    from general_motion_retargeting.params import ROBOT_XML_DICT
+    m = mujoco.MjModel.from_xml_path(str(ROBOT_XML_DICT["unitree_g1"]))
+    d = mujoco.MjData(m)
+    feet = {m.body(b).id for b in ("left_ankle_roll_link", "right_ankle_roll_link")}
+    soles = [g for g in range(m.ngeom)
+             if m.geom_bodyid[g] in feet and m.geom_type[g] == mujoco.mjtGeom.mjGEOM_SPHERE]
+    lows = np.empty(len(root_pos))
+    for i in range(len(root_pos)):
+        d.qpos[:3], d.qpos[3:7], d.qpos[7:] = root_pos[i], root_rot[i], dof[i]
+        mujoco.mj_kinematics(m, d)
+        lows[i] = min(d.geom_xpos[g, 2] - m.geom_size[g, 0] for g in soles)
+    return float(np.median(lows)), lows
+
+
+# Mocap hand bone → the G1 link the IK config (fbx_qtm_to_g1.json) maps it to.
+HAND_LINKS = {"left": ("LeftHand", "left_wrist_yaw_link"),
+              "right": ("RightHand", "right_wrist_yaw_link")}
+
+
+def link_positions(root_pos, root_rot, dof, links):
+    """World positions (T, 3) of G1 bodies, by forward kinematics on the GMR model."""
+    import mujoco
+    from general_motion_retargeting.params import ROBOT_XML_DICT
+    m = mujoco.MjModel.from_xml_path(str(ROBOT_XML_DICT["unitree_g1"]))
+    d = mujoco.MjData(m)
+    ids = {n: m.body(n).id for n in links}
+    out = {n: np.empty((len(root_pos), 3)) for n in links}
+    for i in range(len(root_pos)):
+        d.qpos[:3], d.qpos[3:7], d.qpos[7:] = root_pos[i], root_rot[i], dof[i]
+        mujoco.mj_kinematics(m, d)
+        for n, b in ids.items():
+            out[n][i] = d.xpos[b]
+    return out
+
+
+def hand_object_targets(frames, obj, robot_hands, fps, move_speed=0.1, radius=0.10):
+    """Hands expressed in a rigid body's own frame (e.g. hands on the chair back), per frame.
+
+    in_chair_human  mocap hand bone, actor scale             (T, 3) m, chair frame
+    in_chair_robot  G1 wrist link after retargeting           (T, 3) m, chair frame
+                    (chair at robot scale, as in obj["pos"]; the G1 arm is shorter than
+                    the actor's, so this differs from the human target)
+    grip_human / grip_robot   median hand position in the chair frame while the chair moves
+    contact         hand within `radius` of grip_human (human data: the real contact)
+    Chair frame = the QTM rigid body's axes, after the same yaw/axis change as the actor.
+    """
+    from scipy.ndimage import uniform_filter1d
+    rot_inv = R.from_quat(obj["quat_wxyz"][:, [1, 2, 3, 0]]).inv()
+    p_h = obj["pos_human"]
+    v = np.r_[0.0, np.linalg.norm(np.diff(p_h[:, :2], axis=0), axis=1)] * fps
+    speed = uniform_filter1d(v, max(1, int(round(0.1 * fps))))   # ~0.1 s smoothing
+    moving = speed > move_speed
+    out = {"chair_speed": speed, "chair_moving": moving,
+           "contact_radius": radius, "link": {}}
+    for side, (bone, link) in HAND_LINKS.items():
+        h = np.array([f[bone][0] for f in frames])
+        in_h = rot_inv.apply(h - p_h)
+        in_r = rot_inv.apply(robot_hands[link] - obj["pos"])
+        if moving.sum() >= 0.2 * fps:
+            grip_h, grip_r = np.median(in_h[moving], 0), np.median(in_r[moving], 0)
+            contact = np.linalg.norm(in_h - grip_h, axis=1) < radius
+        else:                                           # chair never pushed: no target
+            grip_h = grip_r = np.full(3, np.nan)
+            contact = np.zeros(len(h), bool)
+        out[side] = {"in_chair_human": in_h, "in_chair_robot": in_r,
+                     "grip_human": grip_h, "grip_robot": grip_r, "contact": contact}
+        out["link"][side] = link
+    return out
 
 
 def visualize(name, root_pos, root_rot, dof, fps=100.0, loop=False):
@@ -210,7 +445,10 @@ def visualize(name, root_pos, root_rot, dof, fps=100.0, loop=False):
         viewer.close()
 
 
-def process_file(fbx_path: str, out_dir: str | None, do_viz: bool, loop: bool = False):
+def process_file(fbx_path: str, out_dir: str | None, do_viz: bool, loop: bool = False,
+                 human_height: float = 1.68, fps_override: float | None = None,
+                 clean: bool = True, ground: bool = True, max_joint_speed: float = 15.0,
+                 start: float = 0.0, end: float | None = None):
     name = Path(fbx_path).stem
     print(f"\n[{name}]")
 
@@ -225,15 +463,68 @@ def process_file(fbx_path: str, out_dir: str | None, do_viz: bool, loop: bool = 
         return
 
     print("  Step 2/3  Loading and converting coordinate frames ...")
-    frames, clean_names = load_npz_as_human_data(npz_path)
-    os.unlink(npz_path)
+    try:
+        frames, clean_names, fps, objects = load_npz_as_human_data(
+            npz_path, start=start, end=end, fps_override=fps_override)
+    except ValueError as e:
+        print(f"  ERROR: {e}")
+        return
+    finally:
+        os.unlink(npz_path)
+    if fps is None:
+        print("  ERROR: FBX frame rate unknown; pass --fps (QTM capture rate, usually 100)")
+        return
     print(f"  Bones ({len(clean_names)}): {clean_names[:5]} ...")
-    print(f"  Frames: {len(frames)}")
+    src = "--fps override" if fps_override else "from FBX"
+    print(f"  Frames: {len(frames)} at {fps:g} fps ({src}) = {len(frames) / fps:.1f} s")
     hips = frames[0].get("Hips", list(frames[0].values())[0])[0]
     print(f"  Hips height[0]: {hips[2]:.3f} m  (expected ~0.85 m)")
+    if "Head" in frames[0]:
+        print(f"  Head joint[0]: {frames[0]['Head'][0][2]:.3f} m  "
+              f"(actor height used for scaling: {human_height:.2f} m; set with --height)")
+
+    if objects:
+        print(f"  Rigid bodies: {', '.join(objects)} (saved in the .pkl under 'objects')")
 
     print("  Step 3/3  Running GMR retargeting ...")
-    root_pos, root_rot, dof = retarget_frames(frames)
+    root_pos, root_rot, dof, root_scale = retarget_frames(frames, human_height)
+
+    if clean:
+        before = np.abs(np.diff(dof, axis=0)).max() * fps
+        dof, flips, ramps = repair_jumps(dof, fps, max_speed=max_joint_speed)
+        speed = np.abs(np.diff(dof, axis=0)) * fps
+        print(f"\n  IK glitch repair: {flips} flip frames interpolated, {ramps} jumps ramped; "
+              f"max joint speed {before:.0f} → {speed.max():.1f} rad/s "
+              f"(p99 {np.percentile(speed, 99):.1f})")
+
+    off = 0.0
+    if ground:
+        off, lows = ground_offset(root_pos, root_rot, dof)
+        root_pos = root_pos.copy()
+        root_pos[:, 2] -= off
+        lows = lows - off
+        print(f"  Ground: shifted root by {-off * 100:+.1f} cm; lowest sole per frame now "
+              f"{lows.min() * 100:+.1f} to {lows.max() * 100:+.1f} cm "
+              f"(5-95%: {np.percentile(lows, 5) * 100:+.1f} to {np.percentile(lows, 95) * 100:+.1f})")
+
+    # Rigid bodies at robot scale: GMR shrinks root travel by root_scale about the origin,
+    # and the root was shifted down by the ground offset.
+    objs = {k: {"pos": np.c_[p[:, :2] * root_scale, p[:, 2:] * root_scale - off],
+                "quat_wxyz": q, "pos_human": p}
+            for k, (p, q) in objects.items()}
+    if objs:
+        hands = link_positions(root_pos, root_rot, dof, [l for _, l in HAND_LINKS.values()])
+        for k, o in objs.items():
+            o["hands"] = t = hand_object_targets(frames, o, hands, fps)
+            mv = t["chair_moving"]
+            msg = [f"  Hands on {k}: chair moving {mv.sum() / fps:.1f} s"]
+            for side in ("left", "right"):
+                s = t[side]
+                if mv.any():
+                    d = np.linalg.norm(s["in_chair_human"][mv] - s["grip_human"], axis=1)
+                    msg.append(f"{side} contact {s['contact'].mean() * 100:.0f}% of take, "
+                               f"spread while moving {d.mean() * 100:.1f} cm")
+            print("; ".join(msg))
 
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
@@ -243,13 +534,25 @@ def process_file(fbx_path: str, out_dir: str | None, do_viz: bool, loop: bool = 
                 "root_pos": root_pos,
                 "root_rot": root_rot,
                 "dof_pos":  dof,
-                "fps":      50.0,
+                "fps":      fps,
                 "source":   fbx_path,
+                "human_height": human_height,
+                "cleaned":  clean,
+                "grounded": ground,
+                "trim_s":   (start, end),
+                # Rigid bodies tracked in QTM (e.g. the chair), per frame, MuJoCo frame:
+                #   pos / quat_wxyz      same scale and ground shift as root_pos, so they line
+                #                        up with the robot (GMR shrinks root travel by root_scale)
+                #   pos_human            actor-scale metres, QTM floor at z=0
+                #   hands                hand targets in the object's frame + contact flags
+                #                        (see hand_object_targets)
+                "root_scale": root_scale,
+                "objects": objs,
             }, f)
         print(f"  Saved → {pkl_path}")
 
     if do_viz:
-        visualize(name, root_pos, root_rot, dof, loop=loop)
+        visualize(name, root_pos, root_rot, dof, fps=fps, loop=loop)
 
 
 def main():
@@ -260,6 +563,19 @@ def main():
     parser.add_argument("--out-dir", default=None, help="Save retargeted .pkl files here")
     parser.add_argument("--no-viz",  action="store_true", help="Skip MuJoCo visualization")
     parser.add_argument("--loop",    action="store_true", help="Loop the visualization")
+    parser.add_argument("--height",  type=float, default=1.68,
+                        help="Actor height in metres, used to scale the human to the G1 (default 1.68)")
+    parser.add_argument("--fps",     type=float, default=None,
+                        help="Override the frame rate read from the FBX (QTM capture rate)")
+    parser.add_argument("--no-clean",  action="store_true",
+                        help="Keep IK flips / jumps instead of smoothing them")
+    parser.add_argument("--max-joint-speed", type=float, default=15.0,
+                        help="rad/s; faster single-frame IK jumps are ramped (default 15)")
+    parser.add_argument("--no-ground", action="store_true",
+                        help="Don't shift the root height so the soles touch the floor")
+    parser.add_argument("--start", type=float, default=0.0,
+                        help="Seconds to cut from the start (e.g. a T-pose); facing is taken from here")
+    parser.add_argument("--end",   type=float, default=None, help="Stop at this time, in seconds")
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -274,7 +590,11 @@ def main():
 
     print(f"Found {len(fbx_files)} FBX file(s)")
     for fbx_path in fbx_files:
-        process_file(fbx_path, args.out_dir, not args.no_viz, loop=args.loop)
+        process_file(fbx_path, args.out_dir, not args.no_viz, loop=args.loop,
+                     human_height=args.height, fps_override=args.fps,
+                     clean=not args.no_clean, ground=not args.no_ground,
+                     max_joint_speed=args.max_joint_speed,
+                     start=args.start, end=args.end)
 
     print("\nDone.")
 
